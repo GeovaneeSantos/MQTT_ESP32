@@ -1,0 +1,6 @@
+#include <Arduino.h> 
+#include <WiFi.h> 
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_ADS1X15.h> 
+#include <Wire.h>

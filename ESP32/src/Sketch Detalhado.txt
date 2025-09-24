@@ -1,0 +1,220 @@
+// Biblioteca padrão do arduino
+#include <Arduino.h> 
+
+// Biblioteca para usar recursos de Wi-Fi 
+#include <WiFi.h> 
+
+// Biblioteca para gerenciamento MQTT
+// Com ela voce pode publicar ou assinar tópicos MQTT
+#include <PubSubClient.h>
+
+// Biblioteca para tratar documentos JSON - JavaScript Object Notation
+#include <ArduinoJson.h>
+
+// Biblioteca para ADS - Conversor Analógico-Digital 
+// Com ela podemos guardar o valor analógico em forma de um numero de base decimal em um espaço de memória
+#include <Adafruit_ADS1X15.h> 
+
+// Biblioteca que permite usar portocolo I2C 
+#include <Wire.h> 
+
+// Pinos das entradas digitais (conforme o datasheet do Norvi)
+// Atribui os nomes DIx_PIN para mapear cada entrada digital
+#define DI0_PIN 27
+#define DI1_PIN 34
+#define DI2_PIN 35
+#define DI3_PIN 14
+#define DI4_PIN 13
+#define DI5_PIN 5
+
+// Configurações de rede Wi-Fi e MQTT
+const char* ssid = ""; // SSID da rede 
+const char* password = ""; // Senha da rede
+const char* mqtt_host = "test.mosquitto.org"; // Endereço Host do broker MQTT, pode ser localhost se estiver rodando localmente
+const uint16_t mqtt_port = 1883; // Porta aberta para comunicação com o broker MQTT
+const char* mqtt_client_id = "Norvi-Wi-Fi-AE04"; // ID de cliente MQTT, ao se conectar a um broker esse ID é usado para distinguir os dispositivos
+const char* mqtt_topic = "texto_norvi_wifi"; // Tópico aberto para assinar ou publicar (Se não existir, ele cria um tópico com o nome desse campo e publica os dados nele)
+
+// Parametro WIFIClient, dispositivo se torna um cliente wifi e recebe atributos TCP/IP
+WiFiClient wifi_client;
+
+// Parâmetro PubSubClient com método de postagem por meio do wifi-client
+// Digamos que aqui estou dizendo use o wifi para publicar os tópicos
+PubSubClient mqtt(wifi_client);
+
+// Instanciando os ADS, podemos "guardar" eles em um endereço de memória 
+// Cria-se mais de um para nao sobrecarregar um ads
+// No caso o ads1 é responsável pelas entradas analógicas de 0 a 3. Já o ads2 das entradas 4 e 5
+Adafruit_ADS1115 ads1; // Endereço 0x48 para as entradas A0-A3
+Adafruit_ADS1115 ads2; // Endereço 0x49 para as entradas A4-A5
+
+// --- Funções Auxiliares ---
+
+// Mapeia o valor do ADC (lido entre 3000 e 15000) para a corrente (4-20 mA)
+float calcularCorrente(int valor_adc) {
+  float valor_float = (float)valor_adc;
+  
+  // (valor_float - 3000.0) ---> Normaliza o valor de entrada. Ele subtrai o valor mínimo da faixa de entrada (3000). Isso move o ponto de partida da faixa para zero. 
+  // Por exemplo, se valor_float for 3000, o resultado é 0. Se for 15000, o resultado é 12000.
+  
+  // (20.0 - 0.0) / (15000.0 - 3000.0) ---> Esta parte calcula o fator de escala. A expressão (20.0 - 0.0) é a amplitude da faixa de saída (20), e (15000.0 - 3000.0) é a amplitude da faixa de entrada (12000). 
+  // O resultado é a proporção que converte a variação de entrada na variação de saída.
+  
+  // (valor_float - 3000.0) * (20.0 - 0.0) / (15000.0 - 3000.0) ----> O resultado do primeiro passo (o valor de entrada normalizado) é multiplicado pelo fator de escala. 
+  // Isso transforma a variação do valor de entrada (que agora começa em 0) na variação correspondente na faixa de saída.
+  
+  // 0.0 + ... ----> O resultado é somado ao valor mínimo da faixa de saída (0.0). Isso "leva" o valor de volta para a faixa de saída desejada, que, neste caso, começa em 0.
+  float corrente_ma = 0.0 + (valor_float - 3000.0) * (20.0 - 0.0) / (15000.0 - 3000.0);
+  
+  // A função ao ter um valor como argumento retorna o resultado do cálculo.
+  return corrente_ma; 
+}
+
+// --- Funções Principais ---
+
+void setup() {
+  // Inicia comunicação SERIAL com Boud Rate de 115200, velocidade de envio das mensagens 
+  // A IDE do arduino precisa estar configurada para se comunicar com essa mesma velocidade
+  // No monitor SERIAL para visualisar as mensagens, também é necessário o mesmo Boud Rate
+  Serial.begin(115200);
+  delay(10);
+  
+  Serial.println("Iniciando Norvi Wi-Fi e sensores...");
+
+  // Inicia a comunicação I2C para os ADCs ADS1115
+  Wire.begin(16, 17); // Pinos I2C conforme o datasheet
+  
+  // Inicializa os dois ADCs em endereços diferentes
+  // Ter endereços diferentes é essencial para o microcontrolador saber qual dos chips está enviando ou recebendo dados.
+  ads1.begin(0x48); // ADS1 rodando no endereço 0x48
+  ads2.begin(0x49); // ADS2 rodando no endereço 0x49
+  
+  // Esta parte configura o ganho do amplificador programável que está dentro do ADC. O ganho determina a sensibilidade do sensor.
+  // O valor GAIN_ONE (que pode ser 1 ou similar) significa que o sinal de entrada não será amplificado.
+  // Isso geralmente corresponde a uma faixa de leitura de tensão de ±4,096V (dependendo do modelo do ADS).
+  ads1.setGain(GAIN_ONE); // Ajuste o ganho se necessário
+  ads2.setGain(GAIN_ONE);
+
+  // Configura os pinos das entradas digitais
+  // pinMode = função do pino 
+  // INPUT = pino com função de entrada 
+  pinMode(DI0_PIN, INPUT);
+  pinMode(DI1_PIN, INPUT);
+  pinMode(DI2_PIN, INPUT);
+  pinMode(DI3_PIN, INPUT);
+  pinMode(DI4_PIN, INPUT);
+  pinMode(DI5_PIN, INPUT);
+
+  // Conectando ao Wi-Fi
+  Serial.print("Conectando a ");
+  Serial.println(ssid);
+
+  // Iniciar conexão com WIFI, os parâmetros ssid e password foram determinados no inicio do código (Linhas 31 e 32)
+  WiFi.begin(ssid, password);
+  
+  // Para ter o feedback de que o dispositivo ainda não se conectou mas esta tentando ele manda para o monitor serial "." a cada 0,5 segundos
+  // Caso o dispositivo efetue a conexão com sucesso esse loop é "quebrado" e passa ao próximo bloco
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("\nWi-Fi conectado!");
+  Serial.print("Endereco IP: ");
+  Serial.println(WiFi.localIP()); // Busca o ip do dispositivo e manda para o monitor Serial
+
+  // Conectando ao broker MQTT
+  Serial.println("Conectando ao broker MQTT...");
+
+  // mqtt.setServer ----> Define para qual servidor (Broker) será feita a conexão
+  mqtt.setServer(mqtt_host, mqtt_port);
+
+  // Define o tamanho (em Bytes) do buffer usado pelo mqtt para armazenar os dados a serem enviados/recebidos
+  // Necessário aumentar caso o tamanho da mensagem exija
+  mqtt.setBufferSize(512); 
+  
+  // !mqtt.connect(mqtt_client_id) ----> se o dispositivo não se conectado ao broker o código entra em um loop infinito 
+  // Caso contrário, se o Handshake (conexão) ocorrer com sucesso ele manda ao serial a mensagem "Conectado ao MQTT!"
+  if (!mqtt.connect(mqtt_client_id)) {
+    Serial.println("Falha ao conectar ao broker MQTT.");
+    while (true);
+  }
+  Serial.println("Conectado ao MQTT!");
+}
+
+void loop() {
+
+  // Esse é um método de reconexão, a comunicação pode ficar instável ou o server cair
+  // Para não ser necessário um reinicio manual do dispositivo, ele verifica se o dispositivo esta ou não conectado ----> if (!mqtt.connected()) 
+  // Se não estiver conectado ele manda ao monitor serial a mensagem "Falha na reconexao" a cada 5 segundos 
+  if (!mqtt.connected()) {
+    Serial.println("Reconectando ao MQTT...");
+    if (!mqtt.connect(mqtt_client_id)) {
+      Serial.println("Falha na reconexao.");
+      delay(5000); 
+      return;
+    }
+  }
+
+  // Se o handshake (conexão) ocorreu com sucesso e o dispositivo se registrou em um tópico 
+  // Então o mqtt mantém-se em um loop de conexão, ele mantem as portas e argumentos de comunicação "rodando"
+  mqtt.loop();
+  
+  // Leitura das entradas digitais
+  int di0_state = digitalRead(DI0_PIN);
+  int di1_state = digitalRead(DI1_PIN);
+  int di2_state = digitalRead(DI2_PIN);
+  int di3_state = digitalRead(DI3_PIN);
+  int di4_state = digitalRead(DI4_PIN);
+  int di5_state = digitalRead(DI5_PIN);
+
+  // Leitura e cálculo das entradas analógicas 
+  // Cada variável corrente_x recebe o resultado da função calcularCorrente
+  // A funçãocalcularCorrente tem como argumento ads1.readADC_SingleEnded(x)
+  // Por exemplo ----> .readADC_SingleEnded(0): Esta função lê o valor do canal 0 do ADC. 
+  // O termo SingleEnded significa que a leitura mede a tensão entre um pino de entrada (o canal 0) e o GND (terra) do circuito. 
+  // O resultado dessa função é um valor digital (inteiro), que reflete a tensão que o sensor está enviando para o pino.
+  float corrente_1 = calcularCorrente(ads1.readADC_SingleEnded(0)); // A0
+  float corrente_2 = calcularCorrente(ads1.readADC_SingleEnded(1)); // A1
+  float corrente_3 = calcularCorrente(ads1.readADC_SingleEnded(2)); // A2
+  float corrente_4 = calcularCorrente(ads1.readADC_SingleEnded(3));
+
+  // Cria um objeto JSON
+  // <300> é o tamanho do documento, pode ser aumentado caso o volume de dados exija
+  // StaticJsonDocument<300> doc ----> cria o objeto JSON com 300 bytes de armazenamento máximo e aloca ele na variavel doc
+  StaticJsonDocument<300> doc;
+  
+  // Preenche o JSON com os estados das entradas digitais
+  // Sintaxe nome_objeto_json[tópico_mqtt] = String(valor);
+  // Dessa maneira o objeto recebe dados válidos para o formato Chave:Valor do JSON
+  // String() é necessário para tornar o qualquer valor computado em string, afinal o JSON só recebe valores em formato string
+  doc["entrada_digital_1"] = String(di0_state);
+  doc["entrada_digital_2"] = String(di1_state);
+  doc["entrada_digital_3"] = String(di2_state);
+  doc["entrada_digital_4"] = String(di3_state);
+  doc["entrada_digital_5"] = String(di4_state);
+  doc["entrada_digital_6"] = String(di5_state);
+
+  // Preenche o JSON com os valores de corrente
+  doc["corrente_mA"] = corrente_1;
+  doc["corrente_mA_2"] = corrente_2;
+  doc["corrente_mA_3"] = corrente_3;
+  doc["corrente_mA_4"] = corrente_4;
+
+// serializeJson() ----> Esta é uma função da biblioteca ArduinoJson que serializa (converte) o conteúdo de um documento JSON.
+// doc ----> É o objeto StaticJsonDocument que declarei anteriormente. Ele contém os dados organizados em formato de JSON
+// output_json -----> É um array de caracteres (uma string em C++) que foi declarado com um tamanho de 300 bytes.
+// É nesse array que a função armazenará o resultado final da serialização, ou seja, a string de texto formatada como JSON {{"chave":"valor"}}
+  char output_json[300];
+  serializeJson(doc, output_json);
+  
+  // Publica o JSON no tópico MQTT
+  if (mqtt.publish(mqtt_topic, output_json)) {
+    Serial.print("JSON publicado com sucesso: ");
+    Serial.println(output_json);
+  } else {
+    Serial.println("Falha na publicacao do JSON.");
+  }
+
+  delay(5000);
+}
